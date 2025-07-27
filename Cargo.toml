@@ -1,0 +1,24 @@
+[package]
+name = "pipe_dream"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+glutin = "0.32.3"
+glutin-winit = "0.5.0"
+gpu-bulwark = { path = "../gpu-bulwark", features = ["nalgebra", "nalgebra-glm"] }
+glm = { version = "0.19", package = "nalgebra-glm" }
+obj-rs = "0.7"
+raw-window-handle = "0.6.2"
+winit = "0.30"
+static_assertions = "1.1.0"
+tracing = "0.1"
+uom = "0.37.0"
+to_trait = "0.1"
+imgui = "0.12"
+imgui-winit-support = "0.13"
+imgui-opengl-renderer = { git = "https://github.com/glampert/rust-imgui-opengl-renderer", branch = "master" }
+tracing-subscriber = "0.3.19"
+bytemuck = "1.23.1"
+anymap = "0.12.1"
