@@ -1,8 +1,9 @@
-pub mod common;
-pub mod physics;
+pub mod backend;
 
-use common::KeyBoard;
-use common::camera::{Camera, Directions, Orientation, Projection};
+use cmn::{common, keyboard, physics, camera};
+
+use keyboard::{KeyBoard, Toggle, toggle::Snooze};
+use camera::{Camera, Directions, Orientation, Projection};
 use common::config::{model_path, shader_path};
 use imgui::Condition;
 
@@ -14,13 +15,10 @@ use gl::shader;
 use gl::vertex_array::Attribute;
 use gl::{Buffer, Program, VertexArray};
 use glsl::MatchingInputs as _;
-use gpu_bulwark as gb;
 use winit::event::ElementState;
 
-use crate::common::toggle::Snooze;
-use crate::common::Toggle;
-use crate::physics::motion::Model as _;
-use crate::physics::{Kinetic, Oriented};
+use physics::motion::Model as _;
+use physics::{Kinetic, Oriented};
 
 type Inputs = glsl::Inputs! {
     layout(location = 0) vec3;
@@ -211,8 +209,8 @@ impl Sample {
     }
 }
 
-impl common::Sample for Sample {
-    fn initialize() -> anyhow::Result<Self> {
+impl common::Logic for Sample {
+    fn initialize(platoform: &common::Platform) -> anyhow::Result<Self> {
         let glsl::vars![vin_position, vin_color] = Inputs::default();
 
         gl::call! {
@@ -243,7 +241,10 @@ impl common::Sample for Sample {
         let global_light_dir = glm::vec3(-1f32, -1f32, -1f32);
         let camera = {
             let view = Orientation::from_direction_and_up(Directions::BACK, Directions::UP);
-            let projection = Projection::perspective(0.01, 100.0, 16.0 / 9.0, 60.0);
+            let projection = Projection::perspective(0.01, 100.0, {
+                let window = platoform.window.inner_size();
+                window.width as f32 / window.height as f32
+            }, 60.0);
 
             Camera::stationary(view, projection, glm::Vec3::zeros())
         };
@@ -350,16 +351,25 @@ impl common::Sample for Sample {
 
     fn config() -> common::config::Config {
         common::config::Config {
-            fullscrreen: true,
-            width: 1920,
-            height: 1080,
+            fullscrreen: false,
+            width: 1430,
+            height: 730,
         }
+    }
+    
+    fn configure_event_loop(event_loop: &winit::event_loop::ActiveEventLoop) {
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    }
+    
+    fn configure_platform(platform: &common::Platform) {
+        platform.window.set_cursor_grab(winit::window::CursorGrabMode::Confined).ok();
+        platform.window.set_cursor_visible(false);
     }
 }
 
 impl common::InteractiveSample for Sample {
     const FREQUENCY: usize = 120;
-    type DCtx = common::KeyBoard;
+    type DCtx = keyboard::KeyBoard;
 
     fn update(&mut self, _: &KeyBoard, _: std::time::Duration) {}
 }
@@ -369,6 +379,6 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::TRACE)
         .init();
 
-    common::run_sample::<Sample>()?;
+    common::run_sample::<Sample, backend::Backend>()?;
     Ok(())
 }

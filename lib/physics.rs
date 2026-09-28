@@ -1,6 +1,5 @@
-use crate::common::{camera::Orientation, Toggle};
-
-use super::KeyBoard;
+use crate::camera::Orientation;
+use crate::keyboard::{Toggle, KeyBoard};
 
 #[derive(Debug, Clone)]
 pub struct KineticState {
