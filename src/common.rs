@@ -5,24 +5,14 @@ use std::io::Write;
 use std::num::NonZeroU32;
 use std::time::{self, Duration};
 
-use glutin::display::GetGlDisplay;
-use glutin::prelude::*;
-use glutin::{context, surface};
-
-use glutin_winit::{DisplayBuilder, GlWindow};
-use imgui::{Condition, Key};
 use raw_window_handle::HasWindowHandle as _;
-use to_trait::To;
 use winit::application::ApplicationHandler;
 use winit::event::{self, DeviceEvent, ElementState, KeyEvent, RawKeyEvent, WindowEvent};
 use winit::event_loop::{self, ActiveEventLoop, EventLoop};
 use winit::keyboard::{self, KeyCode, PhysicalKey};
 use winit::window::{self, CursorGrabMode};
 
-use gpu_bulwark as gb;
-
-
-/// Wrapper around boolean 
+/// Wrapper around boolean
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 pub enum BaseToggle {
@@ -52,7 +42,7 @@ impl BaseToggle {
     }
 
     /// Clear toggle to [Off] state, return true if it was [On].
-    /// 
+    ///
     /// TODO: rename this
     pub const fn impulse(&mut self) -> bool {
         let was_on = self.is_on();
@@ -92,7 +82,7 @@ impl AsRef<BaseToggle> for BaseToggle {
     fn as_ref(&self) -> &BaseToggle {
         self
     }
-}   
+}
 
 impl Toggle for BaseToggle {
     type Mut<T> = T;
@@ -100,7 +90,7 @@ impl Toggle for BaseToggle {
     fn as_mut(&mut self) -> Self::Mut<&mut BaseToggle> {
         self
     }
-    
+
     fn wrapper(&mut self) -> &mut Self {
         self
     }
@@ -217,9 +207,9 @@ pub mod config {
 
 pub mod camera {
     use super::config::{HEIGHT, WIDTH};
-    use glm::{Mat4, Vec3};
+    use crate::physics;
     use crate::physics::{KineticState, Oriented};
-    use crate::{gb, physics};
+    use glm::{Mat4, Vec3};
 
     #[derive(Debug, Copy, Clone)]
     pub struct Directions {
@@ -283,7 +273,9 @@ pub mod camera {
 
     impl From<glm::Quat> for Orientation {
         fn from(orientation: glm::Quat) -> Self {
-            Self { quaterion: orientation }
+            Self {
+                quaterion: orientation,
+            }
         }
     }
 
@@ -291,10 +283,12 @@ pub mod camera {
         pub fn from_direction_and_up(direction: Vec3, up: Vec3) -> Self {
             // Normalize the forward vector (the viewing direction)
             let matrix = glm::look_at(&Vec3::default(), &direction, &glm::Vec3::y());
-        
-            Self { quaterion: glm::mat3_to_quat(&glm::mat4_to_mat3(&matrix)) }
+
+            Self {
+                quaterion: glm::mat3_to_quat(&glm::mat4_to_mat3(&matrix)),
+            }
         }
-        
+
         pub fn matrix(&self, position: &Vec3) -> glm::Mat4 {
             glm::quat_to_mat4(&self.quaterion).transpose()
         }
@@ -371,8 +365,6 @@ pub mod camera {
         }
     }
 
-    static_assertions::assert_impl_all!(Camera: physics::Kinetic);
-
     impl Camera {
         const DEFAULT_FOVY: f32 = 60.0;
         const DEFAULT_Z_NEAR: f32 = 0.1;
@@ -393,7 +385,8 @@ pub mod camera {
         }
 
         pub fn view_matrix(&self) -> glm::Mat4 {
-            self.orientation.matrix(&self.kinetic.position) * glm::translation(&-self.kinetic.position)
+            self.orientation.matrix(&self.kinetic.position)
+                * glm::translation(&-self.kinetic.position)
         }
 
         pub fn projection_matrix(&self) -> glm::Mat4 {
@@ -443,7 +436,7 @@ impl Timer {
 }
 
 pub trait Sample: Sized {
-    fn initialize() -> anyhow::Result<Self>;
+    fn initialize(window: &winit::window::Window) -> anyhow::Result<Self>;
 
     fn render(&mut self);
 
@@ -452,8 +445,6 @@ pub trait Sample: Sized {
     fn on_mouse_movement(&mut self, delta: (f64, f64));
 
     fn update(&mut self, dt: Duration) {}
-
-    fn ui(&self, ui: &mut imgui::Ui);
 
     fn name() -> String;
 
@@ -471,31 +462,8 @@ pub trait InteractiveSample: Sample {
     fn update(&mut self, dctx: &Self::DCtx, dt: Duration);
 }
 
-pub struct ImGui {
-    pub ctx: imgui::Context,
-    pub platform: imgui_winit_support::WinitPlatform,
-    pub renderer: imgui_opengl_renderer::Renderer,
-}
-
-pub struct Snoozer {
-    map: anymap::AnyMap,
-}
-
-impl Snoozer {
-    pub fn register<T: 'static>(&mut self, value: T) {
-        self.map.insert(value);
-    }
-}
-
-pub struct Systems {
-    snoozer: Snoozer,
-}
-
 pub struct State<T> {
     pub window: window::Window,
-    pub surface: surface::Surface<surface::WindowSurface>,
-    pub imgui: ImGui,
-    pub context: context::PossiblyCurrentContext,
     pub inner: T,
 }
 
@@ -543,104 +511,92 @@ impl<T: Sample> App<T> {
                 .with_inner_size(winit::dpi::PhysicalSize::new(config.width, config.height))
                 .with_title(T::name())
                 .with_resizable(false)
-                .with_fullscreen(config.fullscrreen.then(|| winit::window::Fullscreen::Borderless(None)));
-
-            // Glutin gl context initialization
-            let version = context::Version::new(4, 6);
-            tracing::info!(
-                "initializing OpenGL {}.{} core",
-                version.major, version.minor
-            );
-            let template = glutin::config::ConfigTemplateBuilder::new();
-            let display_builder =
-                DisplayBuilder::new().with_window_attributes(Some(window_attributes));
-
-            let config_selector = |configs: Box<
-                dyn Iterator<Item = glutin::config::Config> + '_,
-            >| {
-                configs
-                    .reduce(|accum, config| {
-                        let transparency_check = config.supports_transparency().unwrap_or(false)
-                            & !accum.supports_transparency().unwrap_or(false);
-
-                        if transparency_check || config.num_samples() > accum.num_samples() {
-                            config
-                        } else {
-                            accum
-                        }
-                    })
-                    .expect("at least one configuration is compatible with given template")
-            };
-
-            let (mut window, config) = display_builder
-                .build(event_loop, template, config_selector)
-                .expect("can create display");
-
-            let raw_window_handle = window
-                .as_ref()
-                .and_then(|window| window.window_handle().map(|handle| handle.as_raw()).ok());
-
-            let window = window.take().unwrap();
-
-            window.set_cursor_grab(CursorGrabMode::Confined).ok();
-            window.set_cursor_visible(false);
-
-            let display = config.display();
-
-            let context_attributes =
-                context::ContextAttributesBuilder::new().build(raw_window_handle);
-
-            let not_current_gl_context = unsafe {
-                display
-                    .create_context(&config, &context_attributes)
-                    .expect("failed to create context")
-            };
-
-            
-            let surface = {
-                let attrs = window
-                    .build_surface_attributes(surface::SurfaceAttributesBuilder::default())
-                    .expect("Failed to build surface attributes");
-                
-                unsafe {
+                .with_fullscreen(
                     config
-                        .display()
-                        .create_window_surface(&config, &attrs)
-                        .unwrap()
-                }
-            };
+                        .fullscrreen
+                        .then(|| winit::window::Fullscreen::Borderless(None)),
+                );
 
-            
-            let gl_context = not_current_gl_context
-                .make_current(&surface)
-                .expect("can make surface current");
-            
-            surface.set_swap_interval(&gl_context, surface::SwapInterval::DontWait);
+            let window = event_loop.create_window(window_attributes).unwrap();
 
-            let loader = |symbol| {
-                let symbol = std::ffi::CString::new(symbol).unwrap();
-                display.get_proc_address(symbol.as_c_str()).cast()
-            };
+            // // Glutin gl context initialization
+            // let version = context::Version::new(4, 6);
+            // tracing::info!(
+            //     "initializing OpenGL {}.{} core",
+            //     version.major,
+            //     version.minor
+            // );
+            // let template = glutin::config::ConfigTemplateBuilder::new();
+            // let display_builder =
+            //     DisplayBuilder::new().with_window_attributes(Some(window_attributes));
 
-            gb::load_with(&loader);
+            // let config_selector = |configs: Box<
+            //     dyn Iterator<Item = glutin::config::Config> + '_,
+            // >| {
+            //     configs
+            //         .reduce(|accum, config| {
+            //             let transparency_check = config.supports_transparency().unwrap_or(false)
+            //                 & !accum.supports_transparency().unwrap_or(false);
 
-            let imgui = {
-                let mut ctx = imgui::Context::create();
+            //             if transparency_check || config.num_samples() > accum.num_samples() {
+            //                 config
+            //             } else {
+            //                 accum
+            //             }
+            //         })
+            //         .expect("at least one configuration is compatible with given template")
+            // };
 
-                let mut platform = imgui_winit_support::WinitPlatform::new(&mut ctx);
-                platform.attach_window(ctx.io_mut(), &window, imgui_winit_support::HiDpiMode::Default);
+            // let (mut window, config) = display_builder
+            //     .build(event_loop, template, config_selector)
+            //     .expect("can create display");
 
-                let renderer = imgui_opengl_renderer::Renderer::new(&mut ctx, loader);
+            // let raw_window_handle = window
+            //     .as_ref()
+            //     .and_then(|window| window.window_handle().map(|handle| handle.as_raw()).ok());
 
-                ImGui {
-                    platform,
-                    renderer,
-                    ctx,
-                }
-            };
+            // let window = window.take().unwrap();
+
+            // window.set_cursor_grab(CursorGrabMode::Confined).ok();
+            // window.set_cursor_visible(false);
+
+            // let display = config.display();
+
+            // let context_attributes =
+            //     context::ContextAttributesBuilder::new().build(raw_window_handle);
+
+            // let not_current_gl_context = unsafe {
+            //     display
+            //         .create_context(&config, &context_attributes)
+            //         .expect("failed to create context")
+            // };
+
+            // let surface = {
+            //     let attrs = window
+            //         .build_surface_attributes(surface::SurfaceAttributesBuilder::default())
+            //         .expect("Failed to build surface attributes");
+
+            //     unsafe {
+            //         config
+            //             .display()
+            //             .create_window_surface(&config, &attrs)
+            //             .unwrap()
+            //     }
+            // };
+
+            // let gl_context = not_current_gl_context
+            //     .make_current(&surface)
+            //     .expect("can make surface current");
+
+            // surface.set_swap_interval(&gl_context, surface::SwapInterval::DontWait);
+
+            // let loader = |symbol| {
+            //     let symbol = std::ffi::CString::new(symbol).unwrap();
+            //     display.get_proc_address(symbol.as_c_str()).cast()
+            // };
 
             self.state = Some(match T::initialize() {
-                Ok(inner) => State { inner, window, surface, imgui, context: gl_context },
+                Ok(inner) => State { inner, window },
                 Err(err) => panic!("{err}"),
             });
 
@@ -651,34 +607,7 @@ impl<T: Sample> App<T> {
 
     fn render(&mut self) {
         self.state.as_mut().map(|state| {
-            state.imgui.platform
-                .prepare_frame(state.imgui.ctx.io_mut(), &state.window)
-                .expect("can prepare frame");
-
             state.inner.render();
-            
-            let ui = state.imgui.ctx.new_frame();
-
-            // testbed diagnostics
-            ui.window("Global")
-                .position([0.0, 0.0], Condition::Appearing)
-                .size([300.0, 100.0], Condition::Appearing)
-                .build(|| {
-                    ui.text(format!("fps: {:.2}", 1.0 / self.frame_timer.get().as_secs_f32()));
-                    ui.text(format!("frame time: {:.2} ms", self.frame_timer.get().as_millis()));
-                    ui.text(format!("window size: {}x{}", state.window.inner_size().width, state.window.inner_size().height));
-                    ui.text(format!("sample name: {}", T::name()));
-                });
-
-            // HOLY_SHIT: not rendering to the ui causes rust UB XD
-            state.inner.ui(ui); // step 4
-
-            state.imgui.platform.prepare_render(ui, &state.window); // step 5
-            state.imgui.renderer.render(&mut state.imgui.ctx);
-
-            state.surface
-                .swap_buffers(&state.context)
-                .expect("buffer swapping is successful");
         });
     }
 
@@ -703,6 +632,24 @@ impl<T: Sample> App<T> {
 impl<T: Sample> ApplicationHandler for App<T> {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {}
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: event::StartCause) {
+        match cause {
+            event::StartCause::ResumeTimeReached {
+                start,
+                requested_resume,
+            } => println!("wait time reached"),
+            event::StartCause::WaitCancelled {
+                start,
+                requested_resume,
+            } => panic!("we dont use wait here!"),
+            event::StartCause::Poll => {
+                let dt = self.frame_timer.update();
+                self.state.as_mut().map(|state| state.inner.update(dt));
+            }
+            event::StartCause::Init => self.init(event_loop),
+        }
+    }
+
     fn device_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -711,50 +658,40 @@ impl<T: Sample> ApplicationHandler for App<T> {
     ) {
         match event {
             DeviceEvent::MouseMotion { delta } => self.process_mouse_input(delta),
-            DeviceEvent::Key(RawKeyEvent {
-                physical_key: PhysicalKey::Code(key),
-                state,
-            }) => self.process_key(key, state),
             _ => (),
         }
     }
 
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: event::StartCause) {
-        match cause {
-            event::StartCause::ResumeTimeReached { start, requested_resume } => println!("wait time reached"),
-            event::StartCause::WaitCancelled { start, requested_resume } => panic!("we dont use wait here!"),
-            event::StartCause::Poll => {
-                let dt = self.frame_timer.update();
-                self.state.as_mut().map(|state| state.inner.update(dt));
-            },
-            event::StartCause::Init => self.init(event_loop),
-        }
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: window::WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: window::WindowId,
+        event: WindowEvent,
+    ) {
         let Some(ref mut state) = self.state else {
-            return
+            return;
         };
-        
-        state.imgui.platform.handle_event(&mut state.imgui.ctx.io_mut(), &state.window, &event::Event::<()>::WindowEvent { window_id, event: event.clone() });
 
         match event {
-            WindowEvent::Resized(size) => {
-                if size.width != 0 && size.height != 0 {
-                    state.surface.resize(
-                        &state.context,
-                        NonZeroU32::new(size.width).unwrap(),
-                        NonZeroU32::new(size.height).unwrap(),
-                    );
-                    state.window.request_redraw();
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.process_key(code, event.state)
                 }
+            }
+            WindowEvent::Resized(size) => {
+                // if size.width != 0 && size.height != 0 {
+                //     state.surface.resize(
+                //         &state.context,
+                //         NonZeroU32::new(size.width).unwrap(),
+                //         NonZeroU32::new(size.height).unwrap(),
+                //     );
+                //     state.window.request_redraw();
+                // }
             }
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                state.imgui.ctx.io_mut().update_delta_time(self.frame_timer.get());
-                
                 state.window.request_redraw();
                 self.render();
             }

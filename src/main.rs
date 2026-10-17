@@ -3,178 +3,25 @@ pub mod physics;
 
 use common::KeyBoard;
 use common::camera::{Camera, Directions, Orientation, Projection};
-use common::config::{model_path, shader_path};
-use imgui::Condition;
-
-use std::time::Duration;
-
-use gb::{gl, glsl};
-use gl::buffer::{Draw, Static};
-use gl::shader;
-use gl::vertex_array::Attribute;
-use gl::{Buffer, Program, VertexArray};
-use glsl::MatchingInputs as _;
-use gpu_bulwark as gb;
+use raw_window_handle::HasDisplayHandle;
 use winit::event::ElementState;
 
-use crate::common::toggle::Snooze;
+use ash::{
+    ext::debug_utils,
+    khr::{surface, swapchain},
+    vk, Device, Entry, Instance,
+};
+
+use std::ffi::CString;
+use std::ptr::null;
+use std::time::Duration;
+
 use crate::common::Toggle;
+use crate::common::toggle::Snooze;
 use crate::physics::motion::Model as _;
 use crate::physics::{Kinetic, Oriented};
 
-type Inputs = glsl::Inputs! {
-    layout(location = 0) vec3;
-    layout(location = 1) vec3;
-};
-
-type VsOutputs = glsl::Outputs! {
-    layout(location = 0) vec4;
-};
-
-type FsOutputs = glsl::Outputs! {
-    layout(location = 0) vec4;
-};
-
-type NormalShaderUniforms = glsl::Uniforms! {
-    layout(location = 0) mat4;
-    layout(location = 1) vec3;
-};
-
-type DepthShaderUniforms = glsl::Uniforms! {
-    layout(location = 0) mat4;
-};
-
-type Attributes = gb::HList! {
-    Attribute<glm::Vec3, 0>,
-    Attribute<glm::Vec3, 1>,
-};
-
-pub struct ResumableIterator<'a, T: Iterator>(std::iter::Skip<&'a mut T>);
-
-impl<'a, T: Iterator> ResumableIterator<'a, T> {
-    pub fn new(iter: &'a mut T, index: usize) -> Self {
-        ResumableIterator(iter.skip(index))
-    }
-}
-
-impl<T> Iterator for ResumableIterator<'_, T>
-where
-    T: Iterator,
-{
-    type Item = T::Item;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
-    }
-}
-
-pub struct Programs {
-    light_directions: Program<Inputs, FsOutputs, NormalShaderUniforms, ()>,
-    depth: Program<Inputs, FsOutputs, DepthShaderUniforms, ()>,
-    current_program: usize,
-}
-
-impl Programs {
-    pub fn new(camera: &Camera, global_light_dir: glm::Vec3) -> anyhow::Result<Self> {
-        let vs_inputs = Inputs::default();
-        let vs_outputs = VsOutputs::default();
-
-        let fs_inputs = vs_outputs.matching_inputs();
-        let glsl::vars![fs_output] = FsOutputs::default();
-
-        let glsl::vars![view_matrix_location, global_light_direction_location] =
-            NormalShaderUniforms::default();
-
-        fn load<T: shader::target::Target>(shader: &'static str) -> anyhow::Result<shader::Shader<gb::ts::Uncompiled, T, ()>> {
-            let source = std::fs::read_to_string(shader_path(shader))?;
-            let mut uncompiled_shader = shader::create::<T>();
-            uncompiled_shader.source(&[&source]);
-            Ok(uncompiled_shader)
-        }
-
-        // TODO: load shaders as assets
-        let vs = load::<shader::target::Vertex>("bunny.vert")?
-            .uniform(&view_matrix_location)
-            .compile()?
-            .into_main()
-            .inputs(&vs_inputs)
-            .outputs(&vs_outputs);
-        let normal_fs = load::<shader::target::Fragment>("bunny.frag")?
-            .uniform(&global_light_direction_location)
-            .compile()?
-            .into_main()
-            .inputs(&fs_inputs)
-            .output(&fs_output);
-        let depth_fs = load::<shader::target::Fragment>("depth.frag")?
-            .compile()?
-            .into_main()
-            .inputs(&fs_inputs)
-            .output(&fs_output);
-
-        let matrix = camera.view_projection_matrix();
-
-        let light_directions = Program::builder()
-            .uniforms(|definitions| {
-                definitions
-                    .define(&view_matrix_location, &matrix)
-                    .define(&global_light_direction_location, &global_light_dir)
-            })
-            .no_resources()
-            .vertex_main(&vs)
-            .uniforms(|matcher| {
-                matcher
-                    .bind(&view_matrix_location)
-            })
-            .fragment_main(&normal_fs)
-            .uniforms(|matcher| {
-                matcher.bind(&global_light_direction_location)
-            })
-            .build()?;
-    
-        
-        let depth = Program::builder()
-            .uniforms(|definitions| {
-                definitions
-                    .define(&view_matrix_location, &matrix)
-            })
-            .no_resources()
-            .vertex_main(&vs)
-            .uniforms(|matcher| {
-                matcher
-                    .bind(&view_matrix_location)
-            })
-            .fragment_main(&depth_fs)
-            .build()?;
-
-        Ok(Self {
-            light_directions,
-            depth,
-            current_program: 0,
-        })
-    }
-
-    pub fn current(&mut self) -> CurrentProgram<'_> {
-        if self.current_program == 0 {
-            CurrentProgram::LightDirections(&mut self.light_directions)
-        } else {
-            CurrentProgram::Depth(&mut self.depth)
-        }
-    }
-
-    pub fn toggle(&mut self) {
-        self.current_program ^= 1;
-    }
-}
-
-pub enum CurrentProgram<'a> {
-    LightDirections(&'a mut Program<Inputs, FsOutputs, NormalShaderUniforms, ()>),
-    Depth(&'a mut Program<Inputs, FsOutputs, DepthShaderUniforms, ()>),
-}
-
 pub struct Sample {
-    programs: Programs,
-    vao: VertexArray<Attributes, u16>,
-    global_light_dir: glm::Vec3,
     camera: physics::motion::ExponentialDecay<Camera>,
     keyboard: KeyBoard<Snooze>,
 }
@@ -185,61 +32,32 @@ struct Model {
     pub index: Vec<u16>,
 }
 
-impl Sample {
-    fn load_model() -> Model {
-        use obj::load_obj;
-        use std::fs::File;
-        use std::io::BufReader;
-
-        let input = BufReader::new(File::open(model_path("bunny.obj")).expect("model file exists"));
-        let obj = load_obj::<obj::Vertex, _, _>(input).expect("model can be loaded");
-        let (positions, normals) = obj
-            .vertices
-            .iter()
-            .map(|vertex| {
-                (
-                    glm::Vec3::from(vertex.position),
-                    glm::Vec3::from(vertex.normal),
-                )
-            })
-            .unzip();
-        Model {
-            positions,
-            normals,
-            index: obj.indices,
-        }
-    }
-}
-
 impl common::Sample for Sample {
-    fn initialize() -> anyhow::Result<Self> {
-        let glsl::vars![vin_position, vin_color] = Inputs::default();
+    fn initialize(window: &winit::window::Window) -> anyhow::Result<Self> {
+        let app_name = CString::new(Self::name()).expect("unicode string does not contain zero byte in a sequence");
+        
+        let app_info = vk::ApplicationInfo::default()
+            .api_version(vk::API_VERSION_1_0)
+            .application_name(&app_name);
 
-        gl::call! {
-            #[panic]
-            unsafe {
-                gl::raw::ClearColor(0.4, 0.5, 0.6, 1.0);
-                gl::raw::Enable(gl::raw::DEPTH_TEST);
-            }
+        ash_window::enumerate_required_extensions(window.display_handle().expect("targeting platforms with stable display handle pointer"))
+
+        let extensions = [ash::khr::]
+
+        // TODO: query the platform for required extensions
+
+        let create_instance_info = vk::InstanceCreateInfo {
+            s_type: vk::StructureType::INSTANCE_CREATE_INFO,
+            p_next: null(),
+            flags: cfg!(any(target_os = "macos", target_os = "ios")).then_some(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR).unwrap_or_default(),
+            p_application_info: &app_info,
+            enabled_layer_count: ,
+            pp_enabled_layer_names: todo!(),
+            enabled_extension_count: todo!(),
+            pp_enabled_extension_names: todo!(),
+            _marker: std::marker::PhantomData,
         }
-
-        let model = Self::load_model();
-
-        let mut positions = Buffer::create();
-        positions.data::<(Static, Draw)>(&model.positions);
-
-        let mut colors = Buffer::create();
-        colors.data::<(Static, Draw)>(&model.normals);
-
-        let mut index = Buffer::create();
-        index.data::<(Static, Draw)>(&model.index);
-
-
-        let vao = VertexArray::create()
-            .vertex_attrib_pointer(&vin_position, positions)
-            .vertex_attrib_pointer(&vin_color, colors)
-            .element_buffer(index);
-
+        
         let global_light_dir = glm::vec3(-1f32, -1f32, -1f32);
         let camera = {
             let view = Orientation::from_direction_and_up(Directions::BACK, Directions::UP);
@@ -248,12 +66,7 @@ impl common::Sample for Sample {
             Camera::stationary(view, projection, glm::Vec3::zeros())
         };
 
-        let programs = Programs::new(&camera, global_light_dir)?;
-
         let inner = Self {
-            programs,
-            vao,
-            global_light_dir,
             camera: physics::motion::ExponentialDecay {
                 decay_rate: 0.9,
                 kinetic: camera,
@@ -264,39 +77,9 @@ impl common::Sample for Sample {
         Ok(inner)
     }
 
-    fn ui(&self, ui: &mut imgui::Ui) {
-        ui.window("Hello world")
-            .size([300.0, 100.0], Condition::Appearing)
-            .build(|| {
-                ui.text("Hello world!");
-                ui.text("This is a simple testbed for the physics engine.");
-                ui.text("Use W, A, S, D, space, l-shift keys to move around and mouse to operate the camera");
-            });
-    }
-
-    fn render(&mut self) {
-        gl::call! {
-            #[panic]
-            unsafe {
-                gl::raw::Clear(gl::raw::COLOR_BUFFER_BIT | gl::raw::DEPTH_BUFFER_BIT);
-            }
-        }
-        match self.programs.current() {
-            CurrentProgram::LightDirections(program) => {
-                program.draw_elements(&self.vao);
-            }
-            CurrentProgram::Depth(program) => {
-                program.draw_elements(&self.vao);
-            }
-        }
-    }
+    fn render(&mut self) {}
 
     fn on_key(&mut self, code: winit::keyboard::KeyCode, state: ElementState) {
-        if matches!(code, winit::keyboard::KeyCode::Tab) {
-            self.programs.toggle();
-            return;
-        }
-
         self.keyboard
             .as_mut(code)
             .map(Toggle::as_mut)
@@ -314,27 +97,17 @@ impl common::Sample for Sample {
     }
 
     fn update(&mut self, dt: Duration) {
-        let glsl::vars![matrix, light] = NormalShaderUniforms::default();
-
-        let input_force = physics::compute_input_force(&self.keyboard, self.camera.kinetic.orientation(), 1.0); // physics::steer(&self.keyboard, &mut self.camera.kinetic, dt);
+        let input_force =
+            physics::compute_input_force(&self.keyboard, self.camera.kinetic.orientation(), 1.0);
 
         let mass = 1.0;
         let acceleration = input_force / mass;
 
-        self.camera.kinetic.kinetic_state().apply_acceleration(acceleration, dt.as_secs_f32());
+        self.camera
+            .kinetic
+            .kinetic_state()
+            .apply_acceleration(acceleration, dt.as_secs_f32());
         self.camera.update(dt.as_secs_f32());
-
-        match self.programs.current() {
-            CurrentProgram::LightDirections(program) => program.uniform(&matrix, &self.camera.kinetic.view_projection_matrix()),
-            CurrentProgram::Depth(program) => program.uniform(&matrix, &self.camera.kinetic.view_projection_matrix()),
-        }
-        self.global_light_dir =
-            (glm::rotate(&glm::Mat4::identity(), self.camera.kinetic.kinetic_state().velocity.norm() / 10.0, &glm::Vec3::y_axis())
-                * glm::vec3_to_vec4(&self.global_light_dir))
-            .xyz();
-        if let CurrentProgram::LightDirections(program) = self.programs.current() {
-            program.uniform(&light, &self.global_light_dir)
-        }
     }
 
     fn usage(&self) -> String {
@@ -345,12 +118,12 @@ impl common::Sample for Sample {
     }
 
     fn name() -> String {
-        String::from("testbed")
+        String::from("MOTHERFUCKER")
     }
 
     fn config() -> common::config::Config {
         common::config::Config {
-            fullscrreen: true,
+            fullscrreen: false,
             width: 1920,
             height: 1080,
         }
@@ -366,9 +139,628 @@ impl common::InteractiveSample for Sample {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     common::run_sample::<Sample>()?;
     Ok(())
 }
+
+// use std::{
+//     borrow::Cow, cell::RefCell, default::Default, error::Error, ffi, ops::Drop, os::raw::c_char,
+// };
+
+// use ash::{
+//     Device, Entry, Instance,
+//     ext::debug_utils,
+//     khr::{surface, swapchain},
+//     vk,
+// };
+// use winit::{
+//     event::{ElementState, Event, KeyEvent, WindowEvent},
+//     event_loop::{ControlFlow, EventLoop},
+//     keyboard::{Key, NamedKey},
+//     platform::run_on_demand::EventLoopExtRunOnDemand,
+//     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
+// };
+
+// // The maximum number of frames we allow to be in flight at any given time
+// pub const MAX_FRAME_LATENCY: usize = 3;
+
+// // Simple offset_of macro akin to C++ offsetof
+// #[macro_export]
+// macro_rules! offset_of {
+//     ($base:path, $field:ident) => {{
+//         #[allow(unused_unsafe)]
+//         unsafe {
+//             let b: $base = mem::zeroed();
+//             std::ptr::addr_of!(b.$field) as isize - std::ptr::addr_of!(b) as isize
+//         }
+//     }};
+// }
+
+// #[allow(clippy::too_many_arguments)]
+// pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
+//     device: &Device,
+//     command_buffer: vk::CommandBuffer,
+//     command_buffer_reuse_fence: vk::Fence,
+//     submit_queue: vk::Queue,
+//     wait_mask: &[vk::PipelineStageFlags],
+//     wait_semaphores: &[vk::Semaphore],
+//     signal_semaphores: &[vk::Semaphore],
+//     f: F,
+// ) {
+//     unsafe {
+//         device
+//             .reset_command_buffer(
+//                 command_buffer,
+//                 vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+//             )
+//             .expect("Reset command buffer failed.");
+
+//         let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+//             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+//         device
+//             .begin_command_buffer(command_buffer, &command_buffer_begin_info)
+//             .expect("Begin commandbuffer");
+//         f(device, command_buffer);
+//         device
+//             .end_command_buffer(command_buffer)
+//             .expect("End commandbuffer");
+
+//         let command_buffers = vec![command_buffer];
+
+//         let submit_info = vk::SubmitInfo::default()
+//             .wait_semaphores(wait_semaphores)
+//             .wait_dst_stage_mask(wait_mask)
+//             .command_buffers(&command_buffers)
+//             .signal_semaphores(signal_semaphores);
+
+//         device
+//             .queue_submit(submit_queue, &[submit_info], command_buffer_reuse_fence)
+//             .expect("queue submit failed.");
+//     }
+// }
+
+// unsafe extern "system" fn vulkan_debug_callback(
+//     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+//     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+//     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+//     _user_data: *mut std::os::raw::c_void,
+// ) -> vk::Bool32 {
+//     let callback_data = *p_callback_data;
+//     let message_id_number = callback_data.message_id_number;
+
+//     let message_id_name = if callback_data.p_message_id_name.is_null() {
+//         Cow::from("")
+//     } else {
+//         ffi::CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
+//     };
+
+//     let message = if callback_data.p_message.is_null() {
+//         Cow::from("")
+//     } else {
+//         ffi::CStr::from_ptr(callback_data.p_message).to_string_lossy()
+//     };
+
+//     println!(
+//         "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
+//     );
+
+//     vk::FALSE
+// }
+
+// pub fn find_memorytype_index(
+//     memory_req: &vk::MemoryRequirements,
+//     memory_prop: &vk::PhysicalDeviceMemoryProperties,
+//     flags: vk::MemoryPropertyFlags,
+// ) -> Option<u32> {
+//     memory_prop.memory_types[..memory_prop.memory_type_count as _]
+//         .iter()
+//         .enumerate()
+//         .find(|(index, memory_type)| {
+//             (1 << index) & memory_req.memory_type_bits != 0
+//                 && memory_type.property_flags & flags == flags
+//         })
+//         .map(|(index, _memory_type)| index as _)
+// }
+
+// pub struct ExampleBase {
+//     pub entry: Entry,
+//     pub instance: Instance,
+//     pub device: Device,
+//     pub surface_loader: surface::Instance,
+//     pub swapchain_loader: swapchain::Device,
+//     pub debug_utils_loader: debug_utils::Instance,
+//     pub window: winit::window::Window,
+//     pub event_loop: RefCell<EventLoop<()>>,
+//     pub frame_index: RefCell<usize>,
+//     pub debug_call_back: vk::DebugUtilsMessengerEXT,
+
+//     pub pdevice: vk::PhysicalDevice,
+//     pub device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+//     pub queue_family_index: u32,
+//     pub present_queue: vk::Queue,
+
+//     pub surface: vk::SurfaceKHR,
+//     pub surface_format: vk::SurfaceFormatKHR,
+//     pub surface_resolution: vk::Extent2D,
+
+//     pub swapchain: vk::SwapchainKHR,
+//     pub present_images: Vec<vk::Image>,
+//     pub present_image_views: Vec<vk::ImageView>,
+
+//     pub pool: vk::CommandPool,
+//     pub draw_command_buffers: [vk::CommandBuffer; MAX_FRAME_LATENCY],
+//     pub setup_command_buffer: vk::CommandBuffer,
+//     pub app_setup_command_buffer: vk::CommandBuffer,
+
+//     pub depth_image: vk::Image,
+//     pub depth_image_view: vk::ImageView,
+//     pub depth_image_memory: vk::DeviceMemory,
+
+//     pub present_complete_semaphores: [vk::Semaphore; MAX_FRAME_LATENCY],
+//     pub rendering_complete_semaphores: Vec<vk::Semaphore>,
+
+//     pub draw_commands_reuse_fences: [vk::Fence; MAX_FRAME_LATENCY],
+// }
+
+// impl ExampleBase {
+//     pub fn render_loop<F: Fn(usize)>(&self, f: F) -> Result<(), impl Error> {
+//         self.event_loop.borrow_mut().run_on_demand(|event, elwp| {
+//             elwp.set_control_flow(ControlFlow::Poll);
+//             match event {
+//                 Event::WindowEvent {
+//                     event:
+//                         WindowEvent::CloseRequested
+//                         | WindowEvent::KeyboardInput {
+//                             event:
+//                                 KeyEvent {
+//                                     state: ElementState::Pressed,
+//                                     logical_key: Key::Named(NamedKey::Escape),
+//                                     ..
+//                                 },
+//                             ..
+//                         },
+//                     ..
+//                 } => {
+//                     elwp.exit();
+//                 }
+//                 Event::AboutToWait => {
+//                     let mut frame_index = self.frame_index.borrow_mut();
+
+//                     // The fence from 3 frames ago, that will also be signaled this frame
+//                     let draw_commands_reuse_fence =
+//                         self.draw_commands_reuse_fences[*frame_index % MAX_FRAME_LATENCY];
+//                     unsafe {
+//                         self.device
+//                             .wait_for_fences(&[draw_commands_reuse_fence], true, u64::MAX)
+//                     }
+//                     .expect("Wait for fence failed.");
+
+//                     unsafe { self.device.reset_fences(&[draw_commands_reuse_fence]) }
+//                         .expect("Reset fences failed.");
+
+//                     f(*frame_index);
+//                     *frame_index += 1;
+//                 }
+//                 _ => (),
+//             }
+//         })
+//     }
+
+//     pub fn new(window_width: u32, window_height: u32) -> Result<Self, Box<dyn Error>> {
+//         unsafe {
+//             let event_loop = EventLoop::new()?;
+//             let window = WindowBuilder::new()
+//                 .with_title("Ash - Example")
+//                 .with_inner_size(winit::dpi::LogicalSize::new(
+//                     f64::from(window_width),
+//                     f64::from(window_height),
+//                 ))
+//                 .build(&event_loop)
+//                 .unwrap();
+//             let entry = Entry::linked();
+//             let app_name = c"VulkanTriangle";
+
+//             let layer_names = [c"VK_LAYER_KHRONOS_validation"];
+//             let layers_names_raw: Vec<*const c_char> = layer_names
+//                 .iter()
+//                 .map(|raw_name| raw_name.as_ptr())
+//                 .collect();
+
+//             let mut extension_names =
+//                 ash_window::enumerate_required_extensions(event_loop.display_handle()?.as_raw())
+//                     .unwrap()
+//                     .to_vec();
+//             extension_names.push(debug_utils::NAME.as_ptr());
+
+//             #[cfg(any(target_os = "macos", target_os = "ios"))]
+//             {
+//                 extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+//                 // Enabling this extension is a requirement when using `VK_KHR_portability_subset`
+//                 extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+//             }
+
+//             let appinfo = vk::ApplicationInfo::default()
+//                 .application_name(app_name)
+//                 .application_version(0)
+//                 .engine_name(app_name)
+//                 .engine_version(0)
+//                 .api_version(vk::make_api_version(0, 1, 0, 0));
+
+//             let create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
+//                 vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+//             } else {
+//                 vk::InstanceCreateFlags::default()
+//             };
+
+//             let create_info = vk::InstanceCreateInfo::default()
+//                 .application_info(&appinfo)
+//                 .enabled_layer_names(&layers_names_raw)
+//                 .enabled_extension_names(&extension_names)
+//                 .flags(create_flags);
+
+//             let instance: Instance = entry
+//                 .create_instance(&create_info, None)
+//                 .expect("Instance creation error");
+
+//             let debug_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+//                 .message_severity(
+//                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+//                         | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+//                         | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+//                 )
+//                 .message_type(
+//                     vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+//                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+//                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+//                 )
+//                 .pfn_user_callback(Some(vulkan_debug_callback));
+
+//             let debug_utils_loader = debug_utils::Instance::load(&entry, &instance);
+//             let debug_call_back = debug_utils_loader
+//                 .create_debug_utils_messenger(&debug_info, None)
+//                 .unwrap();
+
+//             let surface_factory = ash_window::SurfaceFactory::new(
+//                 &entry,
+//                 &instance,
+//                 event_loop.display_handle()?.as_raw(),
+//             )
+//             .unwrap();
+//             let surface = surface_factory
+//                 .create_surface(window.window_handle()?.as_raw(), None)
+//                 .unwrap();
+//             let surface_loader = surface::Instance::load(&entry, &instance);
+
+//             let pdevices = instance
+//                 .enumerate_physical_devices()
+//                 .expect("Physical device error");
+//             let (pdevice, queue_family_index) = pdevices
+//                 .iter()
+//                 .find_map(|pdevice| {
+//                     instance
+//                         .get_physical_device_queue_family_properties(*pdevice)
+//                         .iter()
+//                         .enumerate()
+//                         .find_map(|(index, info)| {
+//                             let supports_graphic_and_surface =
+//                                 info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+//                                     && surface_loader
+//                                         .get_physical_device_surface_support(
+//                                             *pdevice,
+//                                             index as u32,
+//                                             surface,
+//                                         )
+//                                         .unwrap();
+//                             if supports_graphic_and_surface {
+//                                 Some((*pdevice, index))
+//                             } else {
+//                                 None
+//                             }
+//                         })
+//                 })
+//                 .expect("Couldn't find suitable device.");
+//             let queue_family_index = queue_family_index as u32;
+//             let device_extension_names_raw = [
+//                 swapchain::NAME.as_ptr(),
+//                 #[cfg(any(target_os = "macos", target_os = "ios"))]
+//                 ash::khr::portability_subset::NAME.as_ptr(),
+//             ];
+//             let features = vk::PhysicalDeviceFeatures {
+//                 shader_clip_distance: 1,
+//                 ..Default::default()
+//             };
+//             let priorities = [1.0];
+
+//             let queue_info = vk::DeviceQueueCreateInfo::default()
+//                 .queue_family_index(queue_family_index)
+//                 .queue_priorities(&priorities);
+
+//             let device_create_info = vk::DeviceCreateInfo::default()
+//                 .queue_create_infos(std::slice::from_ref(&queue_info))
+//                 .enabled_extension_names(&device_extension_names_raw)
+//                 .enabled_features(&features);
+
+//             let device: Device = instance
+//                 .create_device(pdevice, &device_create_info, None)
+//                 .unwrap();
+
+//             let present_queue = device.get_device_queue(queue_family_index, 0);
+
+//             let surface_format = surface_loader
+//                 .get_physical_device_surface_formats(pdevice, surface)
+//                 .unwrap()[0];
+
+//             let surface_capabilities = surface_loader
+//                 .get_physical_device_surface_capabilities(pdevice, surface)
+//                 .unwrap();
+//             let mut desired_image_count = surface_capabilities.min_image_count + 1;
+//             if surface_capabilities.max_image_count > 0
+//                 && desired_image_count > surface_capabilities.max_image_count
+//             {
+//                 desired_image_count = surface_capabilities.max_image_count;
+//             }
+//             let surface_resolution = match surface_capabilities.current_extent.width {
+//                 u32::MAX => vk::Extent2D {
+//                     width: window_width,
+//                     height: window_height,
+//                 },
+//                 _ => surface_capabilities.current_extent,
+//             };
+//             let pre_transform = if surface_capabilities
+//                 .supported_transforms
+//                 .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+//             {
+//                 vk::SurfaceTransformFlagsKHR::IDENTITY
+//             } else {
+//                 surface_capabilities.current_transform
+//             };
+//             let present_modes = surface_loader
+//                 .get_physical_device_surface_present_modes(pdevice, surface)
+//                 .unwrap();
+//             let present_mode = present_modes
+//                 .iter()
+//                 .cloned()
+//                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+//                 .unwrap_or(vk::PresentModeKHR::FIFO);
+//             let swapchain_loader = swapchain::Device::load(&instance, &device);
+
+//             let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
+//                 .surface(surface)
+//                 .min_image_count(desired_image_count)
+//                 .image_color_space(surface_format.color_space)
+//                 .image_format(surface_format.format)
+//                 .image_extent(surface_resolution)
+//                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+//                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+//                 .pre_transform(pre_transform)
+//                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+//                 .present_mode(present_mode)
+//                 .clipped(true)
+//                 .image_array_layers(1);
+
+//             let swapchain = swapchain_loader
+//                 .create_swapchain(&swapchain_create_info, None)
+//                 .unwrap();
+
+//             let pool_create_info = vk::CommandPoolCreateInfo::default()
+//                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+//                 .queue_family_index(queue_family_index);
+
+//             let pool = device.create_command_pool(&pool_create_info, None).unwrap();
+
+//             let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+//                 .command_buffer_count(2 + MAX_FRAME_LATENCY as u32)
+//                 .command_pool(pool)
+//                 .level(vk::CommandBufferLevel::PRIMARY);
+
+//             let command_buffers = device
+//                 .allocate_command_buffers(&command_buffer_allocate_info)
+//                 .unwrap();
+//             let setup_command_buffer = command_buffers[0];
+//             let app_setup_command_buffer = command_buffers[1];
+//             let draw_command_buffers = command_buffers[2..][..MAX_FRAME_LATENCY]
+//                 .try_into()
+//                 .unwrap();
+
+//             let present_images = swapchain_loader.get_swapchain_images(swapchain).unwrap();
+//             let present_image_views: Vec<vk::ImageView> = present_images
+//                 .iter()
+//                 .map(|&image| {
+//                     let create_view_info = vk::ImageViewCreateInfo::default()
+//                         .view_type(vk::ImageViewType::TYPE_2D)
+//                         .format(surface_format.format)
+//                         .components(vk::ComponentMapping {
+//                             r: vk::ComponentSwizzle::R,
+//                             g: vk::ComponentSwizzle::G,
+//                             b: vk::ComponentSwizzle::B,
+//                             a: vk::ComponentSwizzle::A,
+//                         })
+//                         .subresource_range(vk::ImageSubresourceRange {
+//                             aspect_mask: vk::ImageAspectFlags::COLOR,
+//                             base_mip_level: 0,
+//                             level_count: 1,
+//                             base_array_layer: 0,
+//                             layer_count: 1,
+//                         })
+//                         .image(image);
+//                     device.create_image_view(&create_view_info, None).unwrap()
+//                 })
+//                 .collect();
+//             let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
+//             let depth_image_create_info = vk::ImageCreateInfo::default()
+//                 .image_type(vk::ImageType::TYPE_2D)
+//                 .format(vk::Format::D16_UNORM)
+//                 .extent(surface_resolution.into())
+//                 .mip_levels(1)
+//                 .array_layers(1)
+//                 .samples(vk::SampleCountFlags::TYPE_1)
+//                 .tiling(vk::ImageTiling::OPTIMAL)
+//                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+//                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+//             let depth_image = device.create_image(&depth_image_create_info, None).unwrap();
+//             let depth_image_memory_req = device.get_image_memory_requirements(depth_image);
+//             let depth_image_memory_index = find_memorytype_index(
+//                 &depth_image_memory_req,
+//                 &device_memory_properties,
+//                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
+//             )
+//             .expect("Unable to find suitable memory index for depth image.");
+
+//             let depth_image_allocate_info = vk::MemoryAllocateInfo::default()
+//                 .allocation_size(depth_image_memory_req.size)
+//                 .memory_type_index(depth_image_memory_index);
+
+//             let depth_image_memory = device
+//                 .allocate_memory(&depth_image_allocate_info, None)
+//                 .unwrap();
+
+//             device
+//                 .bind_image_memory(depth_image, depth_image_memory, 0)
+//                 .expect("Unable to bind depth image memory");
+
+//             record_submit_commandbuffer(
+//                 &device,
+//                 setup_command_buffer,
+//                 vk::Fence::null(),
+//                 present_queue,
+//                 &[],
+//                 &[],
+//                 &[],
+//                 |device, setup_command_buffer| {
+//                     let layout_transition_barriers = vk::ImageMemoryBarrier::default()
+//                         .image(depth_image)
+//                         .dst_access_mask(
+//                             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+//                                 | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+//                         )
+//                         .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+//                         .old_layout(vk::ImageLayout::UNDEFINED)
+//                         .subresource_range(
+//                             vk::ImageSubresourceRange::default()
+//                                 .aspect_mask(vk::ImageAspectFlags::DEPTH)
+//                                 .layer_count(1)
+//                                 .level_count(1),
+//                         );
+
+//                     device.cmd_pipeline_barrier(
+//                         setup_command_buffer,
+//                         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+//                         vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+//                         vk::DependencyFlags::empty(),
+//                         &[],
+//                         &[],
+//                         &[layout_transition_barriers],
+//                     );
+//                 },
+//             );
+
+//             let depth_image_view_info = vk::ImageViewCreateInfo::default()
+//                 .subresource_range(
+//                     vk::ImageSubresourceRange::default()
+//                         .aspect_mask(vk::ImageAspectFlags::DEPTH)
+//                         .level_count(1)
+//                         .layer_count(1),
+//                 )
+//                 .image(depth_image)
+//                 .format(depth_image_create_info.format)
+//                 .view_type(vk::ImageViewType::TYPE_2D);
+
+//             let depth_image_view = device
+//                 .create_image_view(&depth_image_view_info, None)
+//                 .unwrap();
+
+//             let semaphore_create_info = vk::SemaphoreCreateInfo::default();
+
+//             let present_complete_semaphores = std::array::from_fn(|_| {
+//                 device
+//                     .create_semaphore(&semaphore_create_info, None)
+//                     .unwrap()
+//             });
+//             let rendering_complete_semaphores = (0..present_images.len())
+//                 .map(|_| {
+//                     device
+//                         .create_semaphore(&semaphore_create_info, None)
+//                         .unwrap()
+//                 })
+//                 .collect();
+
+//             let fence_create_info =
+//                 vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+//             let draw_commands_reuse_fences = std::array::from_fn(|_| {
+//                 device
+//                     .create_fence(&fence_create_info, None)
+//                     .expect("Create fence failed.")
+//             });
+
+//             Ok(Self {
+//                 event_loop: RefCell::new(event_loop),
+//                 frame_index: RefCell::new(0),
+//                 entry,
+//                 instance,
+//                 device,
+//                 queue_family_index,
+//                 pdevice,
+//                 device_memory_properties,
+//                 window,
+//                 surface_loader,
+//                 surface_format,
+//                 present_queue,
+//                 surface_resolution,
+//                 swapchain_loader,
+//                 swapchain,
+//                 present_images,
+//                 present_image_views,
+//                 pool,
+//                 draw_command_buffers,
+//                 setup_command_buffer,
+//                 app_setup_command_buffer,
+//                 depth_image,
+//                 depth_image_view,
+//                 present_complete_semaphores,
+//                 rendering_complete_semaphores,
+//                 draw_commands_reuse_fences,
+//                 surface,
+//                 debug_call_back,
+//                 debug_utils_loader,
+//                 depth_image_memory,
+//             })
+//         }
+//     }
+// }
+
+// impl Drop for ExampleBase {
+//     fn drop(&mut self) {
+//         unsafe {
+//             self.device.device_wait_idle().unwrap();
+//             for &semaphore in &self.present_complete_semaphores {
+//                 self.device.destroy_semaphore(semaphore, None);
+//             }
+//             for &semaphore in &self.rendering_complete_semaphores {
+//                 self.device.destroy_semaphore(semaphore, None);
+//             }
+//             for &fence in &self.draw_commands_reuse_fences {
+//                 self.device.destroy_fence(fence, None);
+//             }
+//             self.device.free_memory(self.depth_image_memory, None);
+//             self.device.destroy_image_view(self.depth_image_view, None);
+//             self.device.destroy_image(self.depth_image, None);
+//             for &image_view in &self.present_image_views {
+//                 self.device.destroy_image_view(image_view, None);
+//             }
+//             self.device.destroy_command_pool(self.pool, None);
+//             self.swapchain_loader
+//                 .destroy_swapchain(self.swapchain, None);
+//             self.device.destroy_device(None);
+//             self.surface_loader.destroy_surface(self.surface, None);
+//             self.debug_utils_loader
+//                 .destroy_debug_utils_messenger(self.debug_call_back, None);
+//             self.instance.destroy_instance(None);
+//         }
+//     }
+// }
