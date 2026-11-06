@@ -10,5 +10,5 @@ raw-window-handle = "0.6.2"
 winit = "0.30"
 tracing = "0.1"
 tracing-subscriber = "0.3.19"
-ash = { version = "0.38.0", features = ["linked"] }
+ash = { version = "0.38.0" }
 ash-window = "0.13.0"

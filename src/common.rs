@@ -462,6 +462,8 @@ pub trait InteractiveSample: Sample {
     fn update(&mut self, dctx: &Self::DCtx, dt: Duration);
 }
 
+pub struct Systems {}
+
 pub struct State<T> {
     pub window: window::Window,
     pub inner: T,
@@ -497,8 +499,6 @@ impl<T: Sample> App<T> {
     #[tracing::instrument(skip_all)]
     fn init(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.state.is_none() {
-            event_loop.set_control_flow(event_loop::ControlFlow::Poll);
-
             let config = T::config();
 
             // let icon = hello_textures::logo::uwr();
@@ -519,83 +519,7 @@ impl<T: Sample> App<T> {
 
             let window = event_loop.create_window(window_attributes).unwrap();
 
-            // // Glutin gl context initialization
-            // let version = context::Version::new(4, 6);
-            // tracing::info!(
-            //     "initializing OpenGL {}.{} core",
-            //     version.major,
-            //     version.minor
-            // );
-            // let template = glutin::config::ConfigTemplateBuilder::new();
-            // let display_builder =
-            //     DisplayBuilder::new().with_window_attributes(Some(window_attributes));
-
-            // let config_selector = |configs: Box<
-            //     dyn Iterator<Item = glutin::config::Config> + '_,
-            // >| {
-            //     configs
-            //         .reduce(|accum, config| {
-            //             let transparency_check = config.supports_transparency().unwrap_or(false)
-            //                 & !accum.supports_transparency().unwrap_or(false);
-
-            //             if transparency_check || config.num_samples() > accum.num_samples() {
-            //                 config
-            //             } else {
-            //                 accum
-            //             }
-            //         })
-            //         .expect("at least one configuration is compatible with given template")
-            // };
-
-            // let (mut window, config) = display_builder
-            //     .build(event_loop, template, config_selector)
-            //     .expect("can create display");
-
-            // let raw_window_handle = window
-            //     .as_ref()
-            //     .and_then(|window| window.window_handle().map(|handle| handle.as_raw()).ok());
-
-            // let window = window.take().unwrap();
-
-            // window.set_cursor_grab(CursorGrabMode::Confined).ok();
-            // window.set_cursor_visible(false);
-
-            // let display = config.display();
-
-            // let context_attributes =
-            //     context::ContextAttributesBuilder::new().build(raw_window_handle);
-
-            // let not_current_gl_context = unsafe {
-            //     display
-            //         .create_context(&config, &context_attributes)
-            //         .expect("failed to create context")
-            // };
-
-            // let surface = {
-            //     let attrs = window
-            //         .build_surface_attributes(surface::SurfaceAttributesBuilder::default())
-            //         .expect("Failed to build surface attributes");
-
-            //     unsafe {
-            //         config
-            //             .display()
-            //             .create_window_surface(&config, &attrs)
-            //             .unwrap()
-            //     }
-            // };
-
-            // let gl_context = not_current_gl_context
-            //     .make_current(&surface)
-            //     .expect("can make surface current");
-
-            // surface.set_swap_interval(&gl_context, surface::SwapInterval::DontWait);
-
-            // let loader = |symbol| {
-            //     let symbol = std::ffi::CString::new(symbol).unwrap();
-            //     display.get_proc_address(symbol.as_c_str()).cast()
-            // };
-
-            self.state = Some(match T::initialize() {
+            self.state = Some(match T::initialize(&window) {
                 Ok(inner) => State { inner, window },
                 Err(err) => panic!("{err}"),
             });
@@ -605,11 +529,7 @@ impl<T: Sample> App<T> {
         }
     }
 
-    fn render(&mut self) {
-        self.state.as_mut().map(|state| {
-            state.inner.render();
-        });
-    }
+    fn render(&mut self) {}
 
     fn process_key(&mut self, key: keyboard::KeyCode, state: ElementState) {
         if key == KeyCode::Escape {
@@ -632,6 +552,22 @@ impl<T: Sample> App<T> {
 impl<T: Sample> ApplicationHandler for App<T> {
     fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {}
 
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _: event::DeviceId,
+        event: event::DeviceEvent,
+    ) {
+        match event {
+            DeviceEvent::MouseMotion { delta } => self.process_mouse_input(delta),
+            DeviceEvent::Key(RawKeyEvent {
+                physical_key: PhysicalKey::Code(key),
+                state,
+            }) => self.process_key(key, state),
+            _ => (),
+        }
+    }
+
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: event::StartCause) {
         match cause {
             event::StartCause::ResumeTimeReached {
@@ -641,24 +577,12 @@ impl<T: Sample> ApplicationHandler for App<T> {
             event::StartCause::WaitCancelled {
                 start,
                 requested_resume,
-            } => panic!("we dont use wait here!"),
+            } => {}
             event::StartCause::Poll => {
                 let dt = self.frame_timer.update();
                 self.state.as_mut().map(|state| state.inner.update(dt));
             }
             event::StartCause::Init => self.init(event_loop),
-        }
-    }
-
-    fn device_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _: event::DeviceId,
-        event: event::DeviceEvent,
-    ) {
-        match event {
-            DeviceEvent::MouseMotion { delta } => self.process_mouse_input(delta),
-            _ => (),
         }
     }
 
@@ -673,21 +597,7 @@ impl<T: Sample> ApplicationHandler for App<T> {
         };
 
         match event {
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    self.process_key(code, event.state)
-                }
-            }
-            WindowEvent::Resized(size) => {
-                // if size.width != 0 && size.height != 0 {
-                //     state.surface.resize(
-                //         &state.context,
-                //         NonZeroU32::new(size.width).unwrap(),
-                //         NonZeroU32::new(size.height).unwrap(),
-                //     );
-                //     state.window.request_redraw();
-                // }
-            }
+            WindowEvent::Resized(size) => {}
             WindowEvent::CloseRequested => {
                 event_loop.exit();
             }

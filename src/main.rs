@@ -3,17 +3,12 @@ pub mod physics;
 
 use common::KeyBoard;
 use common::camera::{Camera, Directions, Orientation, Projection};
-use raw_window_handle::HasDisplayHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::event::ElementState;
 
-use ash::{
-    ext::debug_utils,
-    khr::{surface, swapchain},
-    vk, Device, Entry, Instance,
-};
+use ash::{Entry, vk};
 
 use std::ffi::CString;
-use std::ptr::null;
 use std::time::Duration;
 
 use crate::common::Toggle;
@@ -32,32 +27,187 @@ struct Model {
     pub index: Vec<u16>,
 }
 
+unsafe extern "system" fn vullkan_debug_callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _user_data: *mut std::os::raw::c_void,
+) -> vk::Bool32 {
+    use std::{borrow::Cow, ffi::CStr};
+
+    let callback_data = *p_callback_data;
+    let message_id_number = callback_data.message_id_number;
+
+    let message_id_name = if callback_data.p_message_id_name.is_null() {
+        Cow::from("")
+    } else {
+        CStr::from_ptr(callback_data.p_message_id_name).to_string_lossy()
+    };
+
+    let message = if callback_data.p_message.is_null() {
+        Cow::from("")
+    } else {
+        CStr::from_ptr(callback_data.p_message).to_string_lossy()
+    };
+
+    println!(
+        "{message_severity:?}:\n{message_type:?} [{message_id_name} ({message_id_number})] : {message}\n",
+    );
+
+    vk::FALSE
+}
+
 impl common::Sample for Sample {
     fn initialize(window: &winit::window::Window) -> anyhow::Result<Self> {
-        let app_name = CString::new(Self::name()).expect("unicode string does not contain zero byte in a sequence");
-        
+        let display = window
+            .display_handle()
+            .expect("targeting platforms with stable display handle pointer")
+            .as_raw();
+
+        let entry = unsafe { Entry::load()? };
+
+        let app_name = CString::new(Self::name())
+            .expect("unicode string does not contain zero byte in a sequence");
+
         let app_info = vk::ApplicationInfo::default()
             .api_version(vk::API_VERSION_1_0)
             .application_name(&app_name);
 
-        ash_window::enumerate_required_extensions(window.display_handle().expect("targeting platforms with stable display handle pointer"))
+        let layers = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
 
-        let extensions = [ash::khr::]
+        let extensions = {
+            let mut extensions = vec![ash::ext::debug_utils::NAME.as_ptr()];
+
+            let surface_extensions = ash_window::enumerate_required_extensions(
+                window
+                    .display_handle()
+                    .expect("targeting platforms with stable display handle pointer")
+                    .as_raw(),
+            )
+            .unwrap();
+            extensions.extend_from_slice(surface_extensions);
+
+            extensions
+        };
 
         // TODO: query the platform for required extensions
 
-        let create_instance_info = vk::InstanceCreateInfo {
-            s_type: vk::StructureType::INSTANCE_CREATE_INFO,
-            p_next: null(),
-            flags: cfg!(any(target_os = "macos", target_os = "ios")).then_some(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR).unwrap_or_default(),
-            p_application_info: &app_info,
-            enabled_layer_count: ,
-            pp_enabled_layer_names: todo!(),
-            enabled_extension_count: todo!(),
-            pp_enabled_extension_names: todo!(),
-            _marker: std::marker::PhantomData,
-        }
-        
+        let create_instance_info = vk::InstanceCreateInfo::default()
+            .flags(
+                cfg!(any(target_os = "macos", target_os = "ios"))
+                    .then_some(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
+                    .unwrap_or_default(),
+            )
+            .application_info(&app_info)
+            .enabled_extension_names(&extensions)
+            .enabled_layer_names(&layers);
+
+        let instance = unsafe { entry.create_instance(&create_instance_info, None).unwrap() };
+
+        let surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                display,
+                window
+                    .window_handle()
+                    .expect("can obtain the window handle")
+                    .as_raw(),
+                None,
+            )
+            .unwrap()
+        };
+        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+
+        let devices = unsafe {
+            instance
+                .enumerate_physical_devices()
+                .expect("can enumerate physical devices")
+        };
+
+        // choose a logical device
+        let (device, family_index) = devices
+            .iter()
+            .find_map(|physical_device| {
+                let properties =
+                    unsafe { instance.get_physical_device_properties(*physical_device) };
+
+                tracing::info!(
+                    "{}",
+                    properties.device_name_as_c_str().unwrap().to_str().unwrap()
+                );
+
+                // verify that device supports the swapchain extension
+                let swapchain_support = unsafe {
+                    let extensions = instance
+                        .enumerate_device_extension_properties(*physical_device)
+                        .unwrap();
+
+                    extensions.iter().any(|properties| {
+                        std::ffi::CStr::from_ptr(properties.extension_name.as_ptr())
+                            == ash::khr::swapchain::NAME
+                    })
+                };
+
+                if !swapchain_support {
+                    return None;
+                }
+
+                let queue_families = unsafe {
+                    instance.get_physical_device_queue_family_properties(*physical_device)
+                };
+
+                let suitable_queue_family = queue_families
+                    .iter()
+                    .enumerate()
+                    .find(|(index, family)| {
+                        // check if queue can present to the surface
+                        let family_queue_supports_presentation = unsafe {
+                            surface_loader
+                                .get_physical_device_surface_support(
+                                    *physical_device,
+                                    *index as u32,
+                                    surface,
+                                )
+                                .unwrap()
+                        };
+
+                        // check if queue supports graphics
+                        let family_queue_supports_graphics =
+                            family.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+
+                        family_queue_supports_presentation && family_queue_supports_graphics
+                    })
+                    .unwrap();
+
+                Some((physical_device, suitable_queue_family.0))
+            })
+            .expect("graphics capable device is present");
+
+        let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(family_index as _)
+            .queue_priorities(&[1.0])];
+
+        let device_extension_names_raw = [
+            ash::khr::swapchain::NAME.as_ptr(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            ash::khr::portability_subset::NAME.as_ptr(),
+        ];
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&device_extension_names_raw);
+            
+        let device = unsafe {
+            instance
+                .create_device(*device, &device_create_info, None)
+                .unwrap()
+        };
+
+        // create the swapchain
+
+        // 1. get surface support
+
         let global_light_dir = glm::vec3(-1f32, -1f32, -1f32);
         let camera = {
             let view = Orientation::from_direction_and_up(Directions::BACK, Directions::UP);
@@ -498,8 +648,8 @@ fn main() -> anyhow::Result<()> {
 //                 .get_physical_device_surface_capabilities(pdevice, surface)
 //                 .unwrap();
 //             let mut desired_image_count = surface_capabilities.min_image_count + 1;
-//             if surface_capabilities.max_image_count > 0
-//                 && desired_image_count > surface_capabilities.max_image_count
+//             if surface_caabilities.max_image_count > 0
+//                 && desiredp_image_count > surface_capabilities.max_image_count
 //             {
 //                 desired_image_count = surface_capabilities.max_image_count;
 //             }
